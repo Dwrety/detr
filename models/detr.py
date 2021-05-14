@@ -16,6 +16,8 @@ from .matcher import build_matcher
 from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
                            dice_loss, sigmoid_focal_loss)
 from .transformer import build_transformer
+from .linear_transformer import build_linear_transformer
+from .non_local import build_nonlocal_transformer
 
 
 class DETR(nn.Module):
@@ -319,7 +321,7 @@ def build(args):
 
     backbone = build_backbone(args)
 
-    transformer = build_transformer(args)
+    transformer = build_nonlocal_transformer(args)
 
     model = DETR(
         backbone,
