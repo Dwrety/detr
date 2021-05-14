@@ -141,13 +141,19 @@ def reduce_dict(input_dict, average=True):
     if world_size < 2:
         return input_dict
     with torch.no_grad():
+        # print(input_dict)
         names = []
         values = []
         # sort the keys so that they are consistent across processes
         for k in sorted(input_dict.keys()):
             names.append(k)
             values.append(input_dict[k])
-        values = torch.stack(values, dim=0)
+        # print(names, values)
+        try:
+            values = torch.stack(values, dim=0)
+        except:
+            print('problem!!!!!!!!!!!!!!!!!========', input_dict)
+            return input_dict
         dist.all_reduce(values)
         if average:
             values /= world_size

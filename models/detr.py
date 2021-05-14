@@ -16,8 +16,26 @@ from .matcher import build_matcher
 from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
                            dice_loss, sigmoid_focal_loss)
 from .transformer import build_transformer
-from .linear_transformer import build_linear_transformer
-from .non_local import build_nonlocal_transformer
+import numpy as np
+
+
+def select_iou_loss(pred, target, weight, avg_factor=None):
+    if avg_factor is None:
+        avg_factor = pred.size(0)
+    assert pred.size(0) == target.size(0)
+    target = target.clamp(min=0.)
+    area_pred = (pred[:, 0] + pred[:, 2]) * (pred[:, 1] + pred[:, 3])
+    area_gt = (target[:, 0] + target[:, 2]) * (target[:, 1] + target[:, 3])
+    area_i = ((torch.min(pred[:, 0], target[:, 0]) +
+               torch.min(pred[:, 2], target[:, 2])) *
+              (torch.min(pred[:, 1], target[:, 1]) +
+               torch.min(pred[:, 3], target[:, 3])))
+    area_u = area_pred + area_gt - area_i
+    iou = area_i / area_u
+    loc_losses = -torch.log(iou.clamp(min=1e-7))
+
+    return torch.sum(weight * loc_losses) / avg_factor
+
 
 
 class DETR(nn.Module):
@@ -43,6 +61,32 @@ class DETR(nn.Module):
         self.backbone = backbone
         self.aux_loss = aux_loss
 
+        self._init_layers(num_classes)
+
+    def _init_layers(self, num_classes):
+        self.stacked_convs = 3
+        self.feat_channels = 256
+        self.cls_convs = []
+        self.reg_convs = []
+
+        self.cls_convs.append(nn.Conv2d(2048, self.feat_channels, 3, padding=1))
+        self.reg_convs.append(nn.Conv2d(2048, self.feat_channels, 3, padding=1))
+        self.cls_convs.append(nn.ReLU(inplace=True))
+        self.reg_convs.append(nn.ReLU(inplace=True))
+        for i in range(self.stacked_convs):
+            self.cls_convs.append(
+                nn.Conv2d(self.feat_channels, self.feat_channels, 3, padding=1))
+            self.cls_convs.append(nn.ReLU(inplace=True))
+            self.reg_convs.append(
+                nn.Conv2d(self.feat_channels, self.feat_channels, 3, padding=1))
+            self.reg_convs.append(nn.ReLU(inplace=True))
+        self.cls_convs.append(nn.Conv2d(self.feat_channels, num_classes, 3, padding=1))
+        self.reg_convs.append(nn.Conv2d(self.feat_channels, 4, 3, padding=1))
+        self.reg_convs.append(nn.ReLU(inplace=True))
+        self.cls_convs = nn.Sequential(*self.cls_convs)
+        self.reg_convs = nn.Sequential(*self.reg_convs)
+
+
     def forward(self, samples: NestedTensor):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
@@ -66,9 +110,12 @@ class DETR(nn.Module):
         assert mask is not None
         hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
 
+        anchor_map_cls = self.cls_convs(src)
+        anchor_map_box = self.reg_convs(src)
+
         outputs_class = self.class_embed(hs)
         outputs_coord = self.bbox_embed(hs).sigmoid()
-        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1], 'anchor_point_map': (anchor_map_cls, anchor_map_box, mask)}
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
         return out
@@ -192,6 +239,256 @@ class SetCriterion(nn.Module):
         }
         return losses
 
+    def xyxy2xcycwh(self, xyxy):
+        """Convert [x1 y1 x2 y2] box format to [xc yc w h] format."""
+        return torch.cat(
+            (0.5 * (xyxy[:, 0:2] + xyxy[:, 2:4]), xyxy[:, 2:4] - xyxy[:, 0:2]),
+            dim=1)
+
+    def xcycwh2xyxy(self, xywh):
+        """Convert [xc yc w y] box format to [x1 y1 x2 y2] format."""
+        return torch.cat((xywh[:, 0:2] - 0.5 * xywh[:, 2:4],
+                          xywh[:, 0:2] + 0.5 * xywh[:, 2:4]), dim=1)
+
+    def prop_box_bounds(self, boxes, scale, width, height):
+        """Compute proportional box regions.
+
+        Box centers are fixed. Box w and h scaled by scale.
+        """
+        prop_boxes = self.xyxy2xcycwh(boxes)
+        prop_boxes[:, 2:] *= scale
+        prop_boxes = self.xcycwh2xyxy(prop_boxes)
+        x1 = torch.floor(prop_boxes[:, 0]).clamp(0, width - 1).int()
+        y1 = torch.floor(prop_boxes[:, 1]).clamp(0, height - 1).int()
+        x2 = torch.ceil(prop_boxes[:, 2]).clamp(1, width).int()
+        y2 = torch.ceil(prop_boxes[:, 3]).clamp(1, height).int()
+        return x1, y1, x2, y2
+
+    def _meshgrid(self, x, y):
+        xx = x.repeat(len(y))
+        yy = y.view(-1, 1).repeat(1, len(x)).view(-1)
+        return xx, yy
+
+    def point_target_single(self, cls_score_list, bbox_pred_list, gt_bboxes,
+                            gt_labels, s_mask, s_target):
+        num_levels = 1
+        assert len(cls_score_list) == len(bbox_pred_list) == num_levels
+        feat_lvls = torch.zeros_like(gt_labels)
+
+        labels = []
+        label_weights = []
+        bbox_targets = []
+        bbox_locs = []
+        device = bbox_pred_list[0].device
+
+        for lvl in range(num_levels):
+            stride = 32.
+            norm = stride * 4.
+            inds = torch.nonzero(feat_lvls == lvl).squeeze(-1)
+            h, w = cls_score_list[lvl].size()[-2:]
+
+            _labels = torch.zeros_like(
+                cls_score_list[lvl][0], dtype=torch.long)
+            _label_weights = 1 - s_mask[lvl].float()
+            _bbox_targets = bbox_pred_list[lvl].new_zeros((0, 4),
+                                                          dtype=torch.float)
+            _bbox_locs = bbox_pred_list[lvl].new_zeros((0, 3),
+                                                       dtype=torch.long)
+            if len(inds) > 0:
+                boxes = gt_bboxes[inds, :]
+                classes = gt_labels[inds]
+                proj_boxes = boxes / stride
+                ig_x1, ig_y1, ig_x2, ig_y2 = self.prop_box_bounds(
+                    proj_boxes, 0.5, w, h)
+                pos_x1, pos_y1, pos_x2, pos_y2 = self.prop_box_bounds(
+                    proj_boxes, 0.2, w, h)
+                for i in range(len(inds)):
+                    # setup classification ground-truth
+                    _labels[pos_y1[i]:pos_y2[i], pos_x1[i]:
+                            pos_x2[i]] = classes[i]
+                    _label_weights[ig_y1[i]:ig_y2[i], ig_x1[i]:ig_x2[i]] = 0.
+                    _label_weights[pos_y1[i]:pos_y2[i], pos_x1[i]:
+                                   pos_x2[i]] = 1.
+                    # setup localization ground-truth
+                    locs_x = torch.arange(
+                        pos_x1[i], pos_x2[i], device=device, dtype=torch.long)
+                    locs_y = torch.arange(
+                        pos_y1[i], pos_y2[i], device=device, dtype=torch.long)
+                    shift_x = (locs_x.float() + 0.5) * stride
+                    shift_y = (locs_y.float() + 0.5) * stride
+                    shift_xx, shift_yy = self._meshgrid(shift_x, shift_y)
+                    shifts = torch.stack(
+                        (shift_xx, shift_yy, shift_xx, shift_yy), dim=-1)
+                    shifts[:, 0] = shifts[:, 0] - boxes[i, 0]
+                    shifts[:, 1] = shifts[:, 1] - boxes[i, 1]
+                    shifts[:, 2] = boxes[i, 2] - shifts[:, 2]
+                    shifts[:, 3] = boxes[i, 3] - shifts[:, 3]
+                    _bbox_targets = torch.cat((_bbox_targets, shifts / norm),
+                                              dim=0)
+                    locs_xx, locs_yy = self._meshgrid(locs_x, locs_y)
+                    zeros = torch.zeros_like(locs_xx)
+                    locs = torch.stack((zeros, locs_yy, locs_xx), dim=-1)
+                    _bbox_locs = torch.cat((_bbox_locs, locs), dim=0)
+
+            labels.append(_labels)
+            label_weights.append(_label_weights)
+            bbox_targets.append(_bbox_targets)
+            bbox_locs.append(_bbox_locs)
+
+        # compute number of foreground and background points
+        num_pos = 0
+        num_neg = 0
+        for lvl in range(num_levels):
+            npos = bbox_targets[lvl].size(0)
+            num_pos += npos
+            num_neg += (label_weights[lvl].nonzero().size(0) - npos)
+        return (labels, label_weights, bbox_targets, bbox_locs, num_pos,
+                num_neg)
+
+    def images_to_levels(self, target, num_imgs, num_levels, is_cls=True):
+        level_target = []
+        if is_cls:
+            for lvl in range(num_levels):
+                level_target.append(
+                    torch.stack([target[i][lvl] for i in range(num_imgs)],
+                                dim=0))
+        else:
+            for lvl in range(num_levels):
+                level_target.append(
+                    torch.cat([target[j][lvl] for j in range(num_imgs)],
+                              dim=0))
+        return level_target
+
+    def mmdet_sigmoid_focal_loss(self, pred, target, weight, gamma, alpha, avg_factor):
+        pred_sigmoid = pred.sigmoid()
+        targ = torch.zeros_like(pred_sigmoid)
+        ind = (target > 0).nonzero().squeeze(-1)
+        for i in ind:
+            label = target[i] - 1
+            targ[i][label] = 1
+        target = targ.type_as(pred)
+
+        pt = (1 - pred_sigmoid) * target + pred_sigmoid * (1 - target)
+        focal_weight = (alpha * target + (1 - alpha) *
+                        (1 - target)) * pt.pow(gamma)
+        loss = F.binary_cross_entropy_with_logits(
+            pred, target, reduction='none') * focal_weight
+        loss = loss * weight.unsqueeze(-1)
+        loss = loss.sum() / avg_factor
+        return loss
+
+    def loss_single(self, cls_score, bbox_pred, labels, label_weights,
+                    bbox_targets, bbox_locs, num_total_samples):
+        # classification loss
+        labels = labels.reshape(-1)
+        label_weights = label_weights.reshape(-1)
+        cls_score = cls_score.permute(0, 2, 3,
+                                      1).reshape(-1, 91)
+        loss_cls = self.mmdet_sigmoid_focal_loss(
+            cls_score,
+            labels,
+            weight=label_weights,
+            gamma=2,
+            alpha=0.25,
+            avg_factor=num_total_samples)
+        # localization loss
+        if bbox_targets.size(0) == 0:
+            loss_bbox = bbox_pred.new_zeros(1)
+        else:
+            bbox_pred = bbox_pred.permute(0, 2, 3, 1)
+            bbox_pred = bbox_pred[bbox_locs[:, 0], bbox_locs[:, 1],
+                                  bbox_locs[:, 2], :]
+            loss_bbox = select_iou_loss(
+                bbox_pred,
+                bbox_targets,
+                1.,
+                avg_factor=num_total_samples)
+        return loss_cls, loss_bbox
+
+    def loss_anchor_point(self, outputs, targets, indices, num_boxes):
+        losses = {}
+        anchor_map_cls = outputs['anchor_point_map'][0]  # 2x92x24x32
+        anchor_map_box = outputs['anchor_point_map'][1]  # 2x4x24x32
+        anchor_map_mask = outputs['anchor_point_map'][2]  # 2x4x24x32
+
+        assert len(targets) == len(anchor_map_cls) == len(anchor_map_box)
+        cls_scores = [anchor_map_cls]
+        bbox_preds = [anchor_map_box]
+        masks = [anchor_map_mask]
+        gt_bboxes = []
+        gt_labels = []
+        for target in targets:
+            boxes = target['boxes']
+            labels = target['labels']
+            this_size = target['size']
+            w, h = this_size[0], this_size[1]
+            decoder_boxes = boxes * torch.tensor([w, h, w, h], dtype=torch.float32, device=boxes.device)
+            decoder_boxes = box_ops.box_cxcywh_to_xyxy(decoder_boxes)
+            gt_bboxes.append(decoder_boxes)
+            gt_labels.append(labels)
+
+        # point target
+        num_imgs = len(gt_bboxes)
+        gt_bboxes_ignore_list = [None for _ in range(num_imgs)]
+
+        if gt_labels is None:
+            gt_labels = [None for _ in range(num_imgs)]
+
+        num_levels = 1
+        assert len(cls_scores) == len(bbox_preds) == num_levels
+        cls_score_list = []
+        bbox_pred_list = []
+        mask_list = []
+        for img_id in range(num_imgs):
+            cls_score_list.append(
+                [cls_scores[i][img_id].detach() for i in range(num_levels)])
+            bbox_pred_list.append(
+                [bbox_preds[i][img_id].detach() for i in range(num_levels)])
+            mask_list.append(
+                [masks[i][img_id].detach() for i in range(num_levels)])
+
+        all_labels, all_label_weights, all_bbox_targets, all_bbox_locs, num_pos_list, num_neg_list = [],[],[],[],[],[]
+        # point target single
+        for s_cls_score_list, s_bbox_pred_list, s_gt_labels, s_gt_bboxes, s_mask, s_target in zip(cls_score_list, bbox_pred_list, gt_labels, gt_bboxes, mask_list, targets):
+            labels, label_weights, bbox_targets, bbox_locs, num_pos, num_neg = self.point_target_single(
+                s_cls_score_list, s_bbox_pred_list, s_gt_bboxes, s_gt_labels, s_mask, s_target)
+            all_labels.append(labels)
+            all_label_weights.append(label_weights)
+            all_bbox_targets.append(bbox_targets)
+            all_bbox_locs.append(bbox_locs)
+            num_pos_list.append(num_pos)
+            num_neg_list.append(num_neg)
+
+        for i in range(num_imgs):
+            for lvl in range(num_levels):
+                all_bbox_locs[i][lvl][:, 0] = i
+
+        # sampled points of all images
+        num_total_pos = sum([max(num, 1) for num in num_pos_list])
+        num_total_neg = sum([max(num, 1) for num in num_neg_list])
+        # combine targets to a list w.r.t. multiple levels
+        labels_list = self.images_to_levels(all_labels, num_imgs, num_levels,
+                                            True)
+        label_weights_list = self.images_to_levels(all_label_weights, num_imgs,
+                                                   num_levels, True)
+        bbox_targets_list = self.images_to_levels(all_bbox_targets, num_imgs,
+                                                  num_levels, False)
+        bbox_locs_list = self.images_to_levels(all_bbox_locs, num_imgs,
+                                               num_levels, False)
+
+        # end point target
+        num_total_samples = num_total_pos
+        # loss single
+        # only one feature level so only one loss single.  TODO: for loop for multi level
+        loss_cls, loss_bbox = self.loss_single(cls_scores[0], bbox_preds[0], labels_list[0], label_weights_list[0],
+                                               bbox_targets_list[0], bbox_locs_list[0], num_total_samples)
+
+        losses['anchor_map_cls'] = loss_cls
+        losses['anchor_map_box'] = loss_bbox
+
+        return losses
+
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -209,7 +506,8 @@ class SetCriterion(nn.Module):
             'labels': self.loss_labels,
             'cardinality': self.loss_cardinality,
             'boxes': self.loss_boxes,
-            'masks': self.loss_masks
+            'masks': self.loss_masks,
+            'anchor_point': self.loss_anchor_point,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -245,6 +543,9 @@ class SetCriterion(nn.Module):
                 for loss in self.losses:
                     if loss == 'masks':
                         # Intermediate masks losses are too costly to compute, we ignore them.
+                        continue
+                    if loss == 'anchor_point':
+                        #  no need to do anchor point loss here
                         continue
                     kwargs = {}
                     if loss == 'labels':
@@ -321,7 +622,7 @@ def build(args):
 
     backbone = build_backbone(args)
 
-    transformer = build_nonlocal_transformer(args)
+    transformer = build_transformer(args)
 
     model = DETR(
         backbone,
@@ -348,6 +649,10 @@ def build(args):
     losses = ['labels', 'boxes', 'cardinality']
     if args.masks:
         losses += ["masks"]
+    if args.anchor_point:
+        losses += ["anchor_point"]
+        weight_dict['anchor_map_cls'] = 1.
+        weight_dict['anchor_map_box'] = 1.
     criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
                              eos_coef=args.eos_coef, losses=losses)
     criterion.to(device)

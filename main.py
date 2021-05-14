@@ -60,6 +60,11 @@ def get_args_parser():
     parser.add_argument('--masks', action='store_true',
                         help="Train segmentation head if the flag is provided")
 
+    # # # # # # # anchor point supervisor
+    parser.add_argument('--anchor_point', action='store_true',
+                        help="Train an anchor point supervisor on CNN features")
+    # # # # # # #
+
     # Loss
     parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
                         help="Disables auxiliary decoding losses (loss at each layer)")
@@ -83,6 +88,8 @@ def get_args_parser():
     parser.add_argument('--coco_path', type=str)
     parser.add_argument('--coco_panoptic_path', type=str)
     parser.add_argument('--remove_difficult', action='store_true')
+    parser.add_argument('--train_on_split', action='store_true')
+    parser.add_argument('--train_on_val', action='store_true')
 
     parser.add_argument('--output_dir', default='',
                         help='path where to save, empty for no saving')
@@ -90,6 +97,7 @@ def get_args_parser():
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--resume', default='', help='resume from checkpoint')
+    parser.add_argument('--resume_backbone_only', default='', help='resume from checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
@@ -138,8 +146,12 @@ def main(args):
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                   weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
-
-    dataset_train = build_dataset(image_set='train', args=args)
+    if args.train_on_split:
+        dataset_train = build_dataset(image_set='train_split', args=args)
+    elif args.train_on_val:
+        dataset_train = build_dataset(image_set='val_split', args=args)
+    else:
+        dataset_train = build_dataset(image_set='train', args=args)
     dataset_val = build_dataset(image_set='val', args=args)
 
     if args.distributed:
@@ -169,6 +181,12 @@ def main(args):
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
 
     output_dir = Path(args.output_dir)
+
+    if args.resume_backbone_only:
+        assert not args.resume
+        checkpoint = torch.load(args.resume_backbone_only, map_location='cpu')
+        model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(

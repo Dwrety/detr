@@ -121,7 +121,7 @@ def make_coco_transforms(image_set):
 
     scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
 
-    if image_set == 'train':
+    if (image_set == 'train') or (image_set == 'train_split') or (image_set == 'val_split'):
         return T.Compose([
             T.RandomHorizontalFlip(),
             T.RandomSelect(
@@ -151,6 +151,8 @@ def build(image_set, args):
     PATHS = {
         "train": (root / "train2017", root / "annotations" / f'{mode}_train2017.json'),
         "val": (root / "val2017", root / "annotations" / f'{mode}_val2017.json'),
+        "train_split": (root / "train2017", root / "annotations" / f'{mode}_train2017_split.json'),
+        "val_split": (root / "val2017", root / "annotations" / f'{mode}_val2017_split.json'),
     }
 
     img_folder, ann_file = PATHS[image_set]
